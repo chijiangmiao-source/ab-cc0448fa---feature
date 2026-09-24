@@ -34,15 +34,22 @@ from dataclasses import dataclass
 
 
 class GeometryError(Exception):
-    """输入矩形非法时抛出，message 为面向调用方的稳定错误信息。
+    """输入非法时抛出，message 为面向调用方的稳定错误信息。
 
     ``location`` 为结构化输入位置（如 ``{"index": 3, "id": "r7"}``），
-    便于调用方定位；无更细位置时为 ``None``。
+    便于调用方定位；无更细位置时为 ``None``。``code`` 为稳定错误码，
+    审计矩形载荷缺省为 ``invalid_rectangle``。
     """
 
-    def __init__(self, message: str, location: dict | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        location: dict | None = None,
+        code: str = "invalid_rectangle",
+    ) -> None:
         super().__init__(message)
         self.location = location
+        self.code = code
 
 
 @dataclass(frozen=True)

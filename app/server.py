@@ -5,7 +5,11 @@
 * ``POST /api/audit`` —— 请求体为矩形数组（或 ``{"rectangles": [...]}``），
   成功返回 ``{"area": "十进制", "perimeter": "十进制"}``；
   校验失败返回 400 与带输入位置的稳定错误，且不夹带任何部分结果。
-* ``GET  /healthz``   —— 请求校验器与扫描引擎均就绪时 200，否则 503。
+* ``POST /api/separation-audit`` —— 在合法矩形载荷上附加两个整数取样点
+  （``start``/``end``）与每框正整数 ``cost``（≤160 框），全局最小代价
+  顶点割裁决，返回清洗框、总代价与清除后起点可达分区。
+* ``GET  /healthz``   —— 请求校验器、扫描引擎、隔离裁决器均就绪时 200，
+  否则 503。
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .components import registry
 from .geometry import GeometryError, audit_raw
+from .separation import separation_raw
 
 MAX_BODY_BYTES = 64 * 1024 * 1024
 
@@ -52,14 +57,19 @@ class AuditHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "service": "photomask-defect-audit",
-                    "endpoints": {"audit": "POST /api/audit", "health": "GET /healthz"},
+                    "endpoints": {
+                        "audit": "POST /api/audit",
+                        "separation_audit": "POST /api/separation-audit",
+                        "health": "GET /healthz",
+                    },
                 },
             )
             return
         self._send_json(404, {"error": {"code": "not_found", "message": self.path}})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path.split("?", 1)[0] != "/api/audit":
+        path = self.path.split("?", 1)[0]
+        if path not in ("/api/audit", "/api/separation-audit"):
             self._send_json(404, {"error": {"code": "not_found", "message": self.path}})
             return
 
@@ -77,27 +87,19 @@ class AuditHandler(BaseHTTPRequestHandler):
             )
             return
 
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            self._bad_request("invalid Content-Length header", None, "bad_request")
-            return
-        if length <= 0:
-            self._bad_request("empty request body", None, "bad_request")
-            return
-        if length > MAX_BODY_BYTES:
-            self._bad_request(
-                f"request body too large ({length} > {MAX_BODY_BYTES} bytes)",
-                None,
-                "payload_too_large",
-            )
-            return
+        payload = self._read_json_body()
+        if payload is None:
+            return  # 错误响应已发出
 
-        raw = self.rfile.read(length)
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            self._bad_request(f"request body is not valid JSON: {exc}", None, "invalid_json")
+        if path == "/api/separation-audit":
+            try:
+                result = separation_raw(payload)
+            except GeometryError as exc:
+                self._bad_request(
+                    str(exc), exc.location, getattr(exc, "code", "invalid_request")
+                )
+                return
+            self._send_json(200, result)
             return
 
         if isinstance(payload, dict) and "rectangles" in payload:
@@ -113,6 +115,31 @@ class AuditHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json(200, {"area": area, "perimeter": perimeter})
+
+    def _read_json_body(self):
+        """读取并解析 JSON 请求体；失败时已发出 400，返回 None。"""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._bad_request("invalid Content-Length header", None, "bad_request")
+            return None
+        if length <= 0:
+            self._bad_request("empty request body", None, "bad_request")
+            return None
+        if length > MAX_BODY_BYTES:
+            self._bad_request(
+                f"request body too large ({length} > {MAX_BODY_BYTES} bytes)",
+                None,
+                "payload_too_large",
+            )
+            return None
+
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._bad_request(f"request body is not valid JSON: {exc}", None, "invalid_json")
+            return None
 
     def _bad_request(
         self, message: str, location: dict | None, code: str = "invalid_rectangle"

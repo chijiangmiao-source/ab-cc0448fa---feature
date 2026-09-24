@@ -8,7 +8,9 @@
    - 重叠框：面积 10、周长 14；
    - 相邻方框：不计公共边（面积 12、周长 14）；
    - 几何重复框：不增量（面积 6、周长 10）；
-   - 标识重复 / 非法矩形：400 且带输入位置、不夹带部分结果。
+   - 标识重复 / 非法矩形：400 且带输入位置、不夹带部分结果；
+   - 隔离裁决：相切连通链、角点相接连通、端点多重覆盖、同代价字典序裁决、
+     几何重复分别清除、未覆盖/原本不连通的稳定结论。
 
 全部通过退出码 0，否则 1。
 """
@@ -37,7 +39,7 @@ def _fail(label: str, detail: str) -> None:
 
 
 def run_code_tests() -> bool:
-    print("== 1/4 代码测试 ==", flush=True)
+    print("== 1/5 代码测试 ==", flush=True)
     proc = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
         cwd=WORKDIR,
@@ -50,7 +52,7 @@ def run_code_tests() -> bool:
 
 
 def run_build_check() -> bool:
-    print("== 2/4 构建检查（compileall）==", flush=True)
+    print("== 2/5 构建检查（compileall）==", flush=True)
     proc = subprocess.run(
         [sys.executable, "-m", "compileall", "-q", "app", "verify", "tests"],
         cwd=WORKDIR,
@@ -63,7 +65,7 @@ def run_build_check() -> bool:
 
 
 def wait_healthy() -> bool:
-    print("== 3/4 等待服务健康（校验器 + 扫描引擎均就绪）==", flush=True)
+    print("== 3/5 等待服务健康（校验器 + 扫描引擎 + 隔离裁决器均就绪）==", flush=True)
     deadline = time.monotonic() + HEALTH_TIMEOUT_SECONDS
     last = "no response"
     while time.monotonic() < deadline:
@@ -98,8 +100,34 @@ def _post(records):
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
+def _post_sep(rects, start, end):
+    data = json.dumps(
+        {"rectangles": rects, "start": {"x": start[0], "y": start[1]},
+         "end": {"x": end[0], "y": end[1]}}
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{BASE_URL}/api/separation-audit",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def _check(label, cond, detail):
+    if cond:
+        _ok(label, detail)
+        return True
+    _fail(label, detail)
+    return False
+
+
 def run_http_smoke() -> bool:
-    print("== 4/4 API/HTTP 冒烟 ==", flush=True)
+    print("== 4/5 API/HTTP 冒烟（面积/周长）==", flush=True)
     ok = True
 
     # 验收构型：重叠框面积 10、周长 14。
@@ -179,6 +207,147 @@ def run_http_smoke() -> bool:
     return ok
 
 
+def run_separation_smoke() -> bool:
+    print("== 5/5 隔离裁决冒烟（全局最小代价顶点割）==", flush=True)
+    ok = True
+
+    # 相切连通：三框仅共边相接，中间框最便宜，必须精确选中中间框。
+    status, payload = _post_sep(
+        [
+            {"id": "a", "x1": 0, "y1": 0, "x2": 2, "y2": 2, "cost": 50},
+            {"id": "b", "x1": 2, "y1": 0, "x2": 4, "y2": 2, "cost": 1},
+            {"id": "c", "x1": 4, "y1": 0, "x2": 6, "y2": 2, "cost": 50},
+        ],
+        (0, 0),
+        (6, 0),
+    )
+    ok &= _check(
+        "相切连通链全局最小割",
+        status == 200
+        and payload.get("removed") == ["b"]
+        and payload.get("total_cost") == "1"
+        and payload.get("reachable_from_start") == ["a"],
+        f"status={status} payload={payload}",
+    )
+
+    # 仅角点相接：面积重叠为 0，按闭合交集必须连通。
+    status, payload = _post_sep(
+        [
+            {"id": "a", "x1": 0, "y1": 0, "x2": 1, "y2": 1, "cost": 1},
+            {"id": "b", "x1": 1, "y1": 1, "x2": 2, "y2": 2, "cost": 9},
+        ],
+        (0, 0),
+        (2, 2),
+    )
+    ok &= _check(
+        "角点相接按闭合交集连通",
+        status == 200 and payload.get("removed") == ["a"],
+        f"status={status} payload={payload}",
+    )
+
+    # 端点多重覆盖：起点/终点各被两个框覆盖，必须同时切断两端的便宜一侧。
+    status, payload = _post_sep(
+        [
+            {"id": "a", "x1": 0, "y1": 0, "x2": 2, "y2": 1, "cost": 100},
+            {"id": "b", "x1": 0, "y1": 1, "x2": 2, "y2": 2, "cost": 100},
+            {"id": "c", "x1": 2, "y1": 0, "x2": 4, "y2": 1, "cost": 1},
+            {"id": "d", "x1": 2, "y1": 1, "x2": 4, "y2": 2, "cost": 1},
+        ],
+        (0, 1),
+        (4, 1),
+    )
+    ok &= _check(
+        "端点多重覆盖两路同切",
+        status == 200
+        and payload.get("removed") == ["c", "d"]
+        and payload.get("total_cost") == "2"
+        and payload.get("reachable_from_start") == ["a", "b"],
+        f"status={status} payload={payload}",
+    )
+
+    # 同代价规范裁决：切任一单框同价，取升序标识字典序最小。
+    status, payload = _post_sep(
+        [
+            {"id": "a", "x1": 0, "y1": 0, "x2": 1, "y2": 1, "cost": 5},
+            {"id": "b", "x1": 1, "y1": 0, "x2": 2, "y2": 1, "cost": 5},
+            {"id": "c", "x1": 2, "y1": 0, "x2": 3, "y2": 1, "cost": 5},
+        ],
+        (0, 0),
+        (3, 0),
+    )
+    ok &= _check(
+        "同代价取字典序最小方案",
+        status == 200 and payload.get("removed") == ["a"],
+        f"status={status} payload={payload}",
+    )
+
+    # 几何重复：两个完全重合的框互为独立来源，必须分别清除。
+    status, payload = _post_sep(
+        [
+            {"id": "a", "x1": 0, "y1": 0, "x2": 2, "y2": 2, "cost": 3},
+            {"id": "b", "x1": 0, "y1": 0, "x2": 2, "y2": 2, "cost": 4},
+        ],
+        (0, 0),
+        (2, 2),
+    )
+    ok &= _check(
+        "几何重复框分别清除",
+        status == 200
+        and payload.get("removed") == ["a", "b"]
+        and payload.get("total_cost") == "7"
+        and payload.get("reachable_from_start") == [],
+        f"status={status} payload={payload}",
+    )
+
+    # 起点未覆盖：稳定结论，无部分方案。
+    status, payload = _post_sep(
+        [{"id": "a", "x1": 1, "y1": 1, "x2": 2, "y2": 2, "cost": 1}],
+        (0, 0),
+        (1, 1),
+    )
+    ok &= _check(
+        "起点未覆盖给稳定结论且无部分方案",
+        status == 200
+        and payload.get("status") == "not_covered"
+        and payload.get("point") == "start"
+        and "removed" not in payload,
+        f"status={status} payload={payload}",
+    )
+
+    # 两点原本不连通：稳定结论，无部分方案。
+    status, payload = _post_sep(
+        [
+            {"id": "a", "x1": 0, "y1": 0, "x2": 1, "y2": 1, "cost": 1},
+            {"id": "b", "x1": 5, "y1": 5, "x2": 6, "y2": 6, "cost": 1},
+        ],
+        (0, 0),
+        (6, 6),
+    )
+    ok &= _check(
+        "原本不连通给稳定结论且无部分方案",
+        status == 200 and payload.get("status") == "already_separated",
+        f"status={status} payload={payload}",
+    )
+
+    # 非法 cost：400 带位置、无部分结果。
+    status, payload = _post_sep(
+        [
+            {"id": "a", "x1": 0, "y1": 0, "x2": 2, "y2": 2, "cost": 0},
+            {"id": "b", "x1": 2, "y1": 0, "x2": 4, "y2": 2, "cost": 1},
+        ],
+        (0, 0),
+        (4, 0),
+    )
+    err = payload.get("error", {}) if isinstance(payload, dict) else {}
+    ok &= _check(
+        "非正清洗代价被拒绝且无部分结果",
+        status == 400 and err.get("location") == {"index": 0, "id": "a"},
+        f"status={status} payload={payload}",
+    )
+
+    return ok
+
+
 def main() -> int:
     print(f"photomask-audit verifier -> {BASE_URL}", flush=True)
     results = [
@@ -188,7 +357,9 @@ def main() -> int:
     ]
     if results[2]:
         results.append(run_http_smoke())
+        results.append(run_separation_smoke())
     else:
+        results.append(False)
         results.append(False)
 
     print("==================================", flush=True)

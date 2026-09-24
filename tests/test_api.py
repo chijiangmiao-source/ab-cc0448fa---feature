@@ -169,5 +169,194 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(status, 404)
 
 
+class SeparationApiTest(unittest.TestCase):
+    def setUp(self):
+        registry.start_all()
+        self.server = build_server("127.0.0.1", 0)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        _wait_closed(self.server)
+        self.thread.join(timeout=5)
+
+    def _request(self, method, path, body):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode("utf-8"))
+
+    def _payload(self, rects, start=(0, 0), end=(5, 5)):
+        return {
+            "rectangles": rects,
+            "start": {"x": start[0], "y": start[1]},
+            "end": {"x": end[0], "y": end[1]},
+        }
+
+    def test_tangent_chain_global_min_cut(self):
+        # 相切连通：三框仅以共边相接，中间框最便宜。
+        body = self._payload(
+            [
+                {"id": "a", "x1": 0, "y1": 0, "x2": 2, "y2": 2, "cost": 50},
+                {"id": "b", "x1": 2, "y1": 0, "x2": 4, "y2": 2, "cost": 1},
+                {"id": "c", "x1": 4, "y1": 0, "x2": 6, "y2": 2, "cost": 50},
+            ],
+            start=(0, 0),
+            end=(6, 0),
+        )
+        status, payload = self._request("POST", "/api/separation-audit", body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "separated")
+        self.assertEqual(payload["removed"], ["b"])
+        self.assertEqual(payload["total_cost"], "1")
+        self.assertEqual(payload["reachable_from_start"], ["a"])
+
+    def test_corner_touch_is_connectivity(self):
+        # 仅角点相接：面积重叠为 0，但闭合交集非空必须连通。
+        body = self._payload(
+            [
+                {"id": "a", "x1": 0, "y1": 0, "x2": 1, "y2": 1, "cost": 1},
+                {"id": "b", "x1": 1, "y1": 1, "x2": 2, "y2": 2, "cost": 9},
+            ],
+            start=(0, 0),
+            end=(2, 2),
+        )
+        status, payload = self._request("POST", "/api/separation-audit", body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["removed"], ["a"])
+
+    def test_endpoint_multiple_coverage_cuts_both_routes(self):
+        body = self._payload(
+            [
+                {"id": "a", "x1": 0, "y1": 0, "x2": 2, "y2": 1, "cost": 100},
+                {"id": "b", "x1": 0, "y1": 1, "x2": 2, "y2": 2, "cost": 100},
+                {"id": "c", "x1": 2, "y1": 0, "x2": 4, "y2": 1, "cost": 1},
+                {"id": "d", "x1": 2, "y1": 1, "x2": 4, "y2": 2, "cost": 1},
+            ],
+            start=(0, 1),
+            end=(4, 1),
+        )
+        status, payload = self._request("POST", "/api/separation-audit", body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["removed"], ["c", "d"])
+        self.assertEqual(payload["total_cost"], "2")
+        self.assertEqual(payload["reachable_from_start"], ["a", "b"])
+
+    def test_equal_cost_lexicographic_verdict(self):
+        body = self._payload(
+            [
+                {"id": "a", "x1": 0, "y1": 0, "x2": 1, "y2": 1, "cost": 5},
+                {"id": "b", "x1": 1, "y1": 0, "x2": 2, "y2": 1, "cost": 5},
+                {"id": "c", "x1": 2, "y1": 0, "x2": 3, "y2": 1, "cost": 5},
+            ],
+            start=(0, 0),
+            end=(3, 0),
+        )
+        status, payload = self._request("POST", "/api/separation-audit", body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["removed"], ["a"])
+
+    def test_geometric_duplicates_distinct_sources(self):
+        body = self._payload(
+            [
+                {"id": "a", "x1": 0, "y1": 0, "x2": 2, "y2": 2, "cost": 3},
+                {"id": "b", "x1": 0, "y1": 0, "x2": 2, "y2": 2, "cost": 4},
+            ],
+            start=(0, 0),
+            end=(2, 2),
+        )
+        status, payload = self._request("POST", "/api/separation-audit", body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["removed"], ["a", "b"])
+        self.assertEqual(payload["total_cost"], "7")
+        self.assertEqual(payload["reachable_from_start"], [])
+
+    def test_not_covered_stable_no_partial_plan(self):
+        body = self._payload(
+            [{"id": "a", "x1": 1, "y1": 1, "x2": 2, "y2": 2, "cost": 1}],
+            start=(0, 0),
+            end=(1, 1),
+        )
+        status, payload = self._request("POST", "/api/separation-audit", body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "not_covered")
+        self.assertEqual(payload["point"], "start")
+        self.assertNotIn("removed", payload)
+        self.assertNotIn("total_cost", payload)
+
+    def test_already_separated_stable_conclusion(self):
+        body = self._payload(
+            [
+                {"id": "a", "x1": 0, "y1": 0, "x2": 1, "y2": 1, "cost": 1},
+                {"id": "b", "x1": 5, "y1": 5, "x2": 6, "y2": 6, "cost": 1},
+            ],
+            start=(0, 0),
+            end=(6, 6),
+        )
+        status, payload = self._request("POST", "/api/separation-audit", body)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            payload,
+            {"status": "already_separated", "reason": "points_not_connected"},
+        )
+
+    def test_invalid_cost_rejected_with_location(self):
+        body = self._payload(
+            [
+                {"id": "a", "x1": 0, "y1": 0, "x2": 2, "y2": 2, "cost": 0},
+                {"id": "b", "x1": 2, "y1": 0, "x2": 4, "y2": 2, "cost": 1},
+            ],
+            start=(0, 0),
+            end=(4, 0),
+        )
+        status, payload = self._request("POST", "/api/separation-audit", body)
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["location"], {"index": 0, "id": "a"})
+        self.assertNotIn("removed", payload)
+
+    def test_missing_point_400(self):
+        body = {
+            "rectangles": [
+                {"id": "a", "x1": 0, "y1": 0, "x2": 1, "y2": 1, "cost": 1}
+            ],
+            "start": {"x": 0, "y": 0},
+        }
+        status, payload = self._request("POST", "/api/separation-audit", body)
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "invalid_request")
+
+    def test_too_many_rects_400(self):
+        body = self._payload(
+            [
+                {"id": f"r{i}", "x1": i, "y1": 0, "x2": i + 1, "y2": 1, "cost": 1}
+                for i in range(161)
+            ],
+            start=(0, 0),
+            end=(161, 0),
+        )
+        status, payload = self._request("POST", "/api/separation-audit", body)
+        self.assertEqual(status, 400)
+        self.assertIn("1 and 160", payload["error"]["message"])
+
+    def test_audit_endpoint_still_works_alongside(self):
+        # 既有 /api/audit 语义保持不变。
+        body = [
+            {"id": "a", "x1": 0, "y1": 0, "x2": 3, "y2": 2},
+            {"id": "b", "x1": 1, "y1": 1, "x2": 4, "y2": 3},
+        ]
+        status, payload = self._request("POST", "/api/audit", body)
+        self.assertEqual((status, payload), (200, {"area": "10", "perimeter": "14"}))
+
+
 if __name__ == "__main__":
     unittest.main()
