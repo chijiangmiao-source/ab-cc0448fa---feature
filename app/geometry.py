@@ -34,15 +34,25 @@ from dataclasses import dataclass
 
 
 class GeometryError(Exception):
-    """输入矩形非法时抛出，message 为面向调用方的稳定错误信息。
+    """输入非法时抛出，message 为面向调用方的稳定错误信息。
 
     ``location`` 为结构化输入位置（如 ``{"index": 3, "id": "r7"}``），
-    便于调用方定位；无更细位置时为 ``None``。
+    便于调用方定位；无更细位置时为 ``None``。``code`` 为稳定错误码。
     """
 
-    def __init__(self, message: str, location: dict | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        location: dict | None = None,
+        code: str = "invalid_rectangle",
+    ) -> None:
         super().__init__(message)
         self.location = location
+        self.code = code
+
+
+COORD_BOUND = 1_000_000_000
+COST_BOUND = 1_000_000_000
 
 
 @dataclass(frozen=True)
@@ -225,24 +235,30 @@ def audit_rectangles(rects: list[Rect]) -> tuple[int, int]:
     return _sweep(rects)
 
 
-def audit_raw(records: list[dict]) -> tuple[str, str]:
-    """校验并计算，返回十进制字符串 ``(area, perimeter)``。
+def parse_rectangle_records(
+    records: list[dict],
+    *,
+    max_count: int,
+    require_cost: bool = False,
+) -> tuple[list[Rect], list[int]]:
+    """全量校验矩形记录数组，返回 ``(rects, costs)``。
 
-    每条记录形如 ``{"id": ..., "x1": ..., "y1": ..., "x2": ..., "y2": ...}``。
     任何一条非法都抛出 ``GeometryError``，错误信息带输入位置（索引/ID），
-    不返回任何部分结果。
+    调用方不得返回任何部分结果。``require_cost=True`` 时每条记录还必须带
+    正整数 ``cost``（清洗代价）；否则忽略该字段且 ``costs`` 全为 0。
     """
     if not isinstance(records, list):
         raise GeometryError("request body must be a JSON array of rectangles")
-    if not 1 <= len(records) <= 50000:
+    if not 1 <= len(records) <= max_count:
         raise GeometryError(
-            f"rectangle count must be between 1 and 50000, got {len(records)}"
+            f"rectangle count must be between 1 and {max_count}, "
+            f"got {len(records)}"
         )
 
     rects: list[Rect] = []
+    costs: list[int] = []
     seen_ids: set[str] = set()
     required = ("x1", "y1", "x2", "y2")
-    coord_bounds = 1_000_000_000
 
     for pos, rec in enumerate(records):
         loc: dict = {"index": pos}
@@ -269,7 +285,7 @@ def audit_raw(records: list[dict]) -> tuple[str, str]:
                 raise GeometryError(
                     f"{where} (id={rid!r}): '{key}' must be an integer", loc
                 )
-            if abs(val) > coord_bounds:
+            if abs(val) > COORD_BOUND:
                 raise GeometryError(
                     f"{where} (id={rid!r}): '{key}'={val} out of range "
                     f"[-1e9, 1e9]",
@@ -288,9 +304,37 @@ def audit_raw(records: list[dict]) -> tuple[str, str]:
                 f"y1={coords['y1']}, y2={coords['y2']}",
                 loc,
             )
+
+        cost = 0
+        if require_cost:
+            val = rec.get("cost")
+            if isinstance(val, bool) or not isinstance(val, int):
+                raise GeometryError(
+                    f"{where} (id={rid!r}): 'cost' must be a positive integer",
+                    loc,
+                )
+            if not 1 <= val <= COST_BOUND:
+                raise GeometryError(
+                    f"{where} (id={rid!r}): 'cost'={val} out of range "
+                    f"[1, 1e9]",
+                    loc,
+                )
+            cost = val
+
         rects.append(
             Rect(rid, coords["x1"], coords["y1"], coords["x2"], coords["y2"])
         )
+        costs.append(cost)
+    return rects, costs
 
+
+def audit_raw(records: list[dict]) -> tuple[str, str]:
+    """校验并计算，返回十进制字符串 ``(area, perimeter)``。
+
+    每条记录形如 ``{"id": ..., "x1": ..., "y1": ..., "x2": ..., "y2": ...}``。
+    任何一条非法都抛出 ``GeometryError``，错误信息带输入位置（索引/ID），
+    不返回任何部分结果。
+    """
+    rects, _ = parse_rectangle_records(records, max_count=50000)
     area, perimeter = audit_rectangles(rects)
     return str(area), str(perimeter)

@@ -1,7 +1,7 @@
 """服务组件与就绪状态。
 
-健康检查只有在"请求校验器"和"扫描引擎"两个组件都完成启动自检后
-才报告就绪。自检用极小的确定性样本，失败则该组件保持未就绪。
+健康检查只有在"请求校验器"、"扫描引擎"和"隔离引擎"三个组件都完成启动
+自检后才报告就绪。自检用极小的确定性样本，失败则该组件保持未就绪。
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ import threading
 from typing import Callable
 
 from .geometry import GeometryError, Rect, audit_raw, audit_rectangles
+from .separation import separation_audit
 
 
 class Component:
@@ -61,10 +62,28 @@ def _engine_selftest() -> None:
         raise AssertionError(f"engine selftest mismatch: {area=} {perimeter=}")
 
 
+def _separation_selftest() -> None:
+    # 链式相切 a-b-c，b 代价最小：清洗 ["b"]、总代价 2，起点侧仅剩 a。
+    result = separation_audit(
+        [Rect("a", 0, 0, 1, 1), Rect("b", 1, 0, 2, 1), Rect("c", 2, 0, 3, 1)],
+        [5, 2, 9],
+        (0, 0),
+        (2, 0),
+    )
+    if result != {
+        "status": "cleaned",
+        "cleaned": ["b"],
+        "total_cost": "2",
+        "reachable_from_start": ["a"],
+    }:
+        raise AssertionError(f"separation selftest mismatch: {result=}")
+
+
 class ComponentRegistry:
     def __init__(self) -> None:
         self.validator = Component("request-validator", _validator_selftest)
         self.scan_engine = Component("scan-engine", _engine_selftest)
+        self.separation_engine = Component("separation-engine", _separation_selftest)
         self._lock = threading.Lock()
         self._started = False
 
@@ -72,13 +91,14 @@ class ComponentRegistry:
         with self._lock:
             self.validator.start()
             self.scan_engine.start()
+            self.separation_engine.start()
             self._started = True
 
     def status(self) -> tuple[bool, dict[str, dict[str, object]]]:
         """返回 (全部就绪, 各组件状态)。"""
         components = {
             c.name: {"ready": c.ready, **({"error": c.error} if c.error else {})}
-            for c in (self.validator, self.scan_engine)
+            for c in (self.validator, self.scan_engine, self.separation_engine)
         }
         return all(c["ready"] for c in components.values()), components
 
